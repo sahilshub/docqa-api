@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from app.llm.client import LLMRateLimited, LLMUnavailable
 from app.main import app
+from app.schemas.client import Completion
 
 client = TestClient(app)
 
@@ -18,11 +19,12 @@ def test_health():
 
 def test_ask(monkeypatch):
     async def fake(q):
-        return "stub"
+        return Completion("stub", False)
 
     monkeypatch.setattr("app.main.complete", fake)
     r = client.post("/ask", json={"question": "hi"})
-    assert r.status_code == 200 and r.json() == {"answer": "stub"}
+    assert r.status_code == 200
+    assert r.json() == {"answer": "stub", "truncated": False}
 
 
 def test_ask_rate_limited(monkeypatch):
