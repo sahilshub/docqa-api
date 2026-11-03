@@ -4,6 +4,7 @@ import openai
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.schemas.client import Completion
 
 log = logging.getLogger("uvicorn.error")
 
@@ -25,7 +26,7 @@ class LLMRateLimited(Exception):
         self.retry_after = retry_after
 
 
-async def complete(question: str) -> str:
+async def complete(question: str) -> Completion:
     try:
         resp = await _client.chat.completions.create(
             model=settings.llm_model or "llama-3.3-70b-versatile",
@@ -33,7 +34,7 @@ async def complete(question: str) -> str:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": question},
             ],
-            max_completion_tokens=1000,
+            max_completion_tokens=settings.max_completion_tokens,
         )
 
     except openai.RateLimitError as e:
@@ -43,8 +44,12 @@ async def complete(question: str) -> str:
     except (openai.APITimeoutError, openai.APIConnectionError, openai.InternalServerError) as e:
         log.warning("provider unavailable: %s", type(e).__name__)
         raise LLMUnavailable() from e
-    
-    log.info("tokens: %s", resp.usage.total_tokens)
-    log.info("finish_reason: %s", resp.choices[0].finish_reason)
 
-    return resp.choices[0].message.content
+    choice = resp.choices[0]
+    truncated = choice.finish_reason == "length"
+    log.info("tokens=%s finish_reason=%s", resp.usage.total_tokens, choice.finish_reason)
+    
+    if truncated:
+        log.warning("response truncated at token limit")
+
+    return Completion(text=choice.message.content or "", truncated=truncated)
