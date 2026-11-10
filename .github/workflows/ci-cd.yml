@@ -5,7 +5,7 @@ on:
   pull_request:
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  IMAGE: public.ecr.aws/${{ vars.ECR_PUBLIC_ALIAS }}/docqa-api
 
 jobs:
   test:
@@ -25,16 +25,18 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
+      id-token: write   
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -56,12 +58,11 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -e
-            docker pull ghcr.io/${{ github.repository }}:${{ github.sha }}
+            docker pull public.ecr.aws/${{ vars.ECR_PUBLIC_ALIAS }}/docqa-api:${{ github.sha }}
             docker rm -f docqa || true
             docker run -d --name docqa --restart unless-stopped \
               --env-file /opt/docqa/.env -p 80:8000 \
-              ghcr.io/${{ github.repository }}:${{ github.sha }}
+              public.ecr.aws/${{ vars.ECR_PUBLIC_ALIAS }}/docqa-api:${{ github.sha }}
             sleep 8
             curl -fsS http://localhost:80/health
             docker image prune -f
-            
