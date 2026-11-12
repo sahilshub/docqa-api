@@ -17,6 +17,10 @@ Reliability built in: request timeout, bounded retries with backoff, provider 42
 with `Retry-After`, timeout/connection/5xx -> HTTP 503, and answers cut off at the token
 limit are flagged `truncated: true` instead of passing as complete.
 
+Observability: every request and model call writes one JSON log line with a shared request
+id (also returned as `X-Request-ID`), latency, status, token counts, finish reason and error
+type. Streams also log time to first token. Question text is never logged, only its length.
+
 ## Progress
 | Task | What | Status |
 |---|---|---|
@@ -26,18 +30,22 @@ limit are flagged `truncated: true` instead of passing as complete.
 | 1.4 | Timeout, bounded retries with backoff, 429 handling | Done |
 | 1.5 | Handle truncated responses | Done |
 | 1.6 | Streaming responses | Done |
-| 1.7 | Structured logging (request id, latency, tokens, errors) | Next |
+| 1.7 | Structured logging (request id, latency, tokens, errors) | Done |
 | 2.x | Document retrieval, citations, golden-set evals | Planned |
 
-Delivery: every push runs ruff and pytest (24 tests, no real API calls). Merges to `main`
+Delivery: every push runs ruff and pytest (22 endpoint tests, no real API calls). Merges to `main`
 build a Docker image, push it to GHCR and deploy it to AWS EC2, then check `/health`.
 
 ## Failure handling, with tests
-- Provider rate limit (429) -> bounded retries, then HTTP 429 with `Retry-After` ([tests](tests/test_client.py))
-- Provider timeout, connection error or 5xx -> bounded retries, then HTTP 503 ([tests](tests/test_client.py), [tests](tests/test_api.py))
-- Answer stopped at the token limit -> `truncated: true`; empty content handled ([tests](tests/test_truncation.py))
-- Failure before the first streamed token -> real 429/503; failure mid-stream -> `error` event ([tests](tests/test_streaming.py))
-- Invalid request body -> HTTP 422 ([tests](tests/test_api.py))
+Each case is proven by an endpoint test in [tests/test_api.py](tests/test_api.py). The tests
+call the API over HTTP and fake only the provider's SDK call, so the routes, model client,
+error mapping and logging all run for real.
+- Provider rate limit (429) -> bounded retries, then HTTP 429 with `Retry-After`
+- Provider timeout, connection error or 5xx -> bounded retries, then HTTP 503
+- Answer stopped at the token limit -> `truncated: true`; empty content handled
+- Failure before the first streamed token -> real 429/503; failure mid-stream -> `error` event
+- Invalid request body -> HTTP 422
+- Any failure is traceable: provider errors and unhandled exceptions are logged with the request id and error type
 
 ## Architecture
 ```mermaid
@@ -70,15 +78,11 @@ On Windows PowerShell use `curl.exe`. Docker: `docker build -t docqa-api . && do
 | `MAX_COMPLETION_TOKENS` | Cap on generated tokens per answer | `5000` |
 | `REQUEST_TIMEOUT_SECONDS` | Model-call timeout | `30` |
 
-## Limitations
-- `/ask` is a plain model call for now: no documents, retrieval or citations yet
-- No evals or metrics yet; results will be added when the eval suite exists
-- A failure after streaming starts can't change the HTTP status (already 200), so clients must watch for the `error` event
-- Single EC2 instance; each deploy restarts the container with a few seconds of downtime
-
 ## Structure
 ```
 app/main.py         routes            app/config.py   env settings
 app/llm/client.py   model provider    app/schemas/    request/response models
-tests/              24 tests          .github/workflows/ci-cd.yml   test, build, deploy
+app/logging_config.py   JSON logs with request id
+tests/test_api.py   22 endpoint tests
+.github/workflows/ci-cd.yml   test, build, deploy
 ```

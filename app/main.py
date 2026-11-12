@@ -1,12 +1,54 @@
 import json
+import logging
+import re
+import time
+import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.llm.client import LLMRateLimited, LLMUnavailable, complete, stream_complete
+from app.logging_config import request_id_var, setup_logging
 from app.schemas.api import AskRequest, AskResponse
 
+setup_logging()
+log = logging.getLogger("docqa.api")
+
 app = FastAPI(title="docqa-api")
+
+_SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 1)
+
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    """Give every request an id and write one log line when it finishes.
+
+    A caller's X-Request-ID is reused if it is short and plain; otherwise a new
+    one is generated. The id is returned in the X-Request-ID response header.
+    """
+    incoming = request.headers.get("x-request-id", "")
+    request_id = incoming if _SAFE_REQUEST_ID.fullmatch(incoming) else uuid.uuid4().hex
+    token = request_id_var.set(request_id)
+    start = time.perf_counter()
+    fields = {"method": request.method, "path": request.url.path}
+    try:
+        response = await call_next(request)
+    except Exception:
+        log.exception("request_failed", extra={**fields, "latency_ms": _elapsed_ms(start)})
+        raise
+    else:
+        response.headers["X-Request-ID"] = request_id
+        log.info(
+            "request",
+            extra={**fields, "status": response.status_code, "latency_ms": _elapsed_ms(start)},
+        )
+        return response
+    finally:
+        request_id_var.reset(token)
 
 
 @app.get("/health")
