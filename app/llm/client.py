@@ -1,4 +1,5 @@
 import logging
+import time
 from collections.abc import AsyncIterator
 
 import openai
@@ -7,7 +8,7 @@ from openai import AsyncOpenAI
 from app.config import settings
 from app.schemas.client import Completion
 
-log = logging.getLogger("uvicorn.error")
+log = logging.getLogger("docqa.llm")
 
 _client = AsyncOpenAI(
     base_url=settings.groq_base_url,
@@ -27,10 +28,30 @@ class LLMRateLimited(Exception):
         self.retry_after = retry_after
 
 
+def _model() -> str:
+    return settings.llm_model or "llama-3.3-70b-versatile"
+
+
+def _elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 1)
+
+
+def _log_error(event: str, exc: Exception, start: float) -> None:
+    log.warning(
+        event,
+        extra={
+            "model": _model(),
+            "error_type": type(exc).__name__,
+            "latency_ms": _elapsed_ms(start),
+        },
+    )
+
+
 async def complete(question: str) -> Completion:
+    start = time.perf_counter()
     try:
         resp = await _client.chat.completions.create(
-            model=settings.llm_model or "llama-3.3-70b-versatile",
+            model=_model(),
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": question},
@@ -39,27 +60,45 @@ async def complete(question: str) -> Completion:
         )
 
     except openai.RateLimitError as e:
-        log.warning("429 after retries")
+        _log_error("llm_rate_limited", e, start)
         raise LLMRateLimited(e.response.headers.get("retry-after")) from e
-    
-    except (openai.APITimeoutError, openai.APIConnectionError, openai.InternalServerError) as e:
-        log.warning("provider unavailable: %s", type(e).__name__)
+
+    except (
+        openai.APITimeoutError,
+        openai.APIConnectionError,
+        openai.InternalServerError,
+    ) as e:
+        _log_error("llm_unavailable", e, start)
         raise LLMUnavailable() from e
 
     choice = resp.choices[0]
     truncated = choice.finish_reason == "length"
-    log.info("tokens=%s finish_reason=%s", resp.usage.total_tokens, choice.finish_reason)
-    
-    if truncated:
-        log.warning("response truncated at token limit")
-
+    usage = resp.usage
+    log.log(
+        logging.WARNING if truncated else logging.INFO,
+        "llm_call",
+        extra={
+            "model": _model(),
+            "latency_ms": _elapsed_ms(start),
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+            "finish_reason": choice.finish_reason,
+            "truncated": truncated,
+            "question_chars": len(question),  # never log the question text itself
+        },
+    )
     return Completion(text=choice.message.content or "", truncated=truncated)
 
 
 async def stream_complete(question: str) -> AsyncIterator[dict]:
+    start = time.perf_counter()
+    first_token_ms = None
+    finish_reason = None
+    usage = None
     try:
         stream = await _client.chat.completions.create(
-            model=settings.llm_model or "llama-3.3-70b-versatile",
+            model=_model(),
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": question},
@@ -67,20 +106,42 @@ async def stream_complete(question: str) -> AsyncIterator[dict]:
             max_completion_tokens=settings.max_completion_tokens,
             stream=True,
         )
-        finish_reason = None
         async for chunk in stream:
+            usage = getattr(chunk, "usage", None) or usage
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
             if choice.delta and choice.delta.content:
+                if first_token_ms is None:
+                    first_token_ms = _elapsed_ms(start)
                 yield {"type": "delta", "text": choice.delta.content}
             if choice.finish_reason:
                 finish_reason = choice.finish_reason
 
     except openai.RateLimitError as e:
+        _log_error("llm_rate_limited", e, start)
         raise LLMRateLimited(e.response.headers.get("retry-after")) from e
-    
-    except (openai.APITimeoutError, openai.APIConnectionError, openai.InternalServerError) as e:
+
+    except (
+        openai.APITimeoutError,
+        openai.APIConnectionError,
+        openai.InternalServerError,
+    ) as e:
+        _log_error("llm_unavailable", e, start)
         raise LLMUnavailable() from e
 
-    yield {"type": "done", "truncated": finish_reason == "length"}
+    truncated = finish_reason == "length"
+    log.log(
+        logging.WARNING if truncated else logging.INFO,
+        "llm_stream",
+        extra={
+            "model": _model(),
+            "latency_ms": _elapsed_ms(start),
+            "first_token_ms": first_token_ms,
+            "total_tokens": getattr(usage, "total_tokens", None),
+            "finish_reason": finish_reason,
+            "truncated": truncated,
+            "question_chars": len(question),
+        },
+    )
+    yield {"type": "done", "truncated": truncated}
